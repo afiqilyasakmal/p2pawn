@@ -1,65 +1,256 @@
-import Image from "next/image";
+"use client";
+
+import { useCallback, useEffect, useRef, useState } from "react";
+import { Chess, Square } from "chess.js";
+import { usePeerConnection } from "@/hooks/usePeerConnection";
+import { Lobby } from "@/components/Lobby";
+import { WaitingRoom } from "@/components/WaitingRoom";
+import { GameBoard } from "@/components/GameBoard";
+import { ConnectionStatusBar } from "@/components/ConnectionStatusBar";
+import { MoveHistory } from "@/components/MoveHistory";
+
+type GamePhase = "lobby" | "waiting" | "playing" | "ended";
 
 export default function Home() {
+  const [phase, setPhase] = useState<GamePhase>("lobby");
+  const [chess, setChess] = useState<Chess>(() => new Chess());
+  const [orientation, setOrientation] = useState<"white" | "black">("white");
+  const [lastMove, setLastMove] = useState<{ from: string; to: string } | null>(null);
+  const [gameOverReason, setGameOverReason] = useState("");
+
+  // Keep a ref to chess so callbacks always have the latest state
+  const chessRef = useRef(chess);
+  chessRef.current = chess;
+
+  const onMoveReceived = useCallback(
+    (move: { from: string; to: string; promotion?: string; fen: string; pgn: string }) => {
+      const game = chessRef.current;
+      try {
+        const result = game.move({
+          from: move.from as Square,
+          to: move.to as Square,
+          promotion: (move.promotion as "q" | "r" | "n" | "b") || undefined,
+        });
+        if (result) {
+          setChess(new Chess(game.fen()));
+          setLastMove({ from: move.from, to: move.to });
+
+          // Check game over
+          if (game.isGameOver()) {
+            setPhase("ended");
+            if (game.isCheckmate()) setGameOverReason("Checkmate!");
+            else if (game.isDraw()) setGameOverReason("Draw");
+            else if (game.isStalemate()) setGameOverReason("Stalemate");
+            else if (game.isThreefoldRepetition()) setGameOverReason("Draw by repetition");
+            else setGameOverReason("Game over");
+          }
+        }
+      } catch {
+        // Invalid move from peer — ignore
+      }
+    },
+    []
+  );
+
+  const onPeerDisconnected = useCallback(() => {
+    setPhase("ended");
+    setGameOverReason("Opponent disconnected");
+  }, []);
+
+  const onConnectionEstablished = useCallback((role: "host" | "joiner" | null) => {
+    setPhase("playing");
+    setOrientation(role === "host" ? "white" : "black");
+    setChess(new Chess());
+    setLastMove(null);
+    setGameOverReason("");
+  }, []);
+
+  const onError = useCallback((_error: string) => {
+    // Errors are already surfaced via `error` state in usePeerConnection
+  }, []);
+
+  const {
+    peerId,
+    status,
+    role,
+    error,
+    waitingExpired,
+    createGame,
+    joinGame,
+    sendMove,
+    disconnect,
+    reset,
+  } = usePeerConnection({
+    onMoveReceived,
+    onPeerDisconnected,
+    onConnectionEstablished,
+    onError,
+  });
+
+  // Handle creating a game
+  const handleCreateGame = useCallback(() => {
+    createGame();
+  }, [createGame]);
+
+  // Move to waiting phase once peerId (Game ID) is available
+  useEffect(() => {
+    if (peerId && status === "connecting" && role === "host") {
+      setPhase("waiting");
+    }
+  }, [peerId, status, role]);
+
+  // Handle waiting expired
+  useEffect(() => {
+    if (waitingExpired) {
+      setPhase("lobby");
+    }
+  }, [waitingExpired]);
+
+  // Handle local move
+  const handleLocalMove = useCallback(
+    (from: string, to: string, promotion?: string) => {
+      const game = chessRef.current;
+      try {
+        const move = game.move({
+          from: from as Square,
+          to: to as Square,
+          promotion: promotion as "q" | "r" | "n" | "b" | undefined,
+        });
+        if (move) {
+          // Update local state
+          setChess(new Chess(game.fen()));
+          setLastMove({ from, to });
+
+          // Send move to peer
+          sendMove({
+            from,
+            to,
+            promotion,
+            fen: game.fen(),
+            pgn: game.pgn(),
+          });
+
+          // Check game over
+          if (game.isGameOver()) {
+            setPhase("ended");
+            if (game.isCheckmate()) setGameOverReason("Checkmate!");
+            else if (game.isDraw()) setGameOverReason("Draw");
+            else if (game.isStalemate()) setGameOverReason("Stalemate");
+            else if (game.isThreefoldRepetition()) setGameOverReason("Draw by repetition");
+            else setGameOverReason("Game over");
+          }
+        }
+      } catch {
+        // Invalid move — shouldn't happen
+      }
+    },
+    [sendMove]
+  );
+
+  // Handle leaving/returning to lobby
+  const handleLeave = useCallback(() => {
+    disconnect();
+    setPhase("lobby");
+    setChess(new Chess());
+    setLastMove(null);
+    setGameOverReason("");
+  }, [disconnect]);
+
+  const handleCancelWaiting = useCallback(() => {
+    reset();
+    setPhase("lobby");
+    setChess(new Chess());
+    setLastMove(null);
+    setGameOverReason("");
+  }, [reset]);
+
+  const isCheck = chess.isCheck() && !chess.isGameOver();
+
   return (
-    <div className="flex flex-col flex-1 items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex flex-1 w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
-        />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the page.tsx file.
+    <div className="flex flex-col flex-1 min-h-screen">
+      {/* Header */}
+      <header className="border-b border-stone-200 bg-white/80 backdrop-blur-md sticky top-0 z-20">
+        <div className="max-w-4xl mx-auto px-4 h-14 flex items-center justify-between">
+          <h1 className="text-lg font-light text-stone-700 tracking-tight">
+            P2Pawn
           </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
-          </p>
+          {phase !== "lobby" && (
+            <div className="flex items-center gap-3">
+              <ConnectionStatusBar status={status} role={role} />
+              <button
+                onClick={handleLeave}
+                className="text-xs text-stone-500 hover:text-red-600 transition-colors font-medium"
+              >
+                Leave
+              </button>
+            </div>
+          )}
         </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={16}
+      </header>
+
+      {/* Main Content */}
+      <main className="flex-1 flex flex-col items-center justify-center py-8 px-4">
+        {phase === "lobby" && (
+          <Lobby
+            onCreateGame={handleCreateGame}
+            onJoinGame={joinGame}
+            error={error}
+          />
+        )}
+
+        {phase === "waiting" && peerId && (
+          <WaitingRoom
+            gameId={peerId}
+            waitingExpired={waitingExpired}
+            onCancel={handleCancelWaiting}
+          />
+        )}
+
+        {phase === "playing" && (
+          <div className="w-full max-w-[500px] mx-auto space-y-4">
+            <GameBoard
+              chess={chess}
+              role={role}
+              status={status}
+              orientation={orientation}
+              onMove={handleLocalMove}
+              lastMove={lastMove}
+              isCheck={isCheck}
+              gameOver={false}
+              gameOverReason=""
             />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
-          </a>
-        </div>
+            <MoveHistory chess={chess} />
+          </div>
+        )}
+
+        {phase === "ended" && (
+          <div className="w-full max-w-[500px] mx-auto space-y-4">
+            <GameBoard
+              chess={chess}
+              role={role}
+              status={status}
+              orientation={orientation}
+              onMove={handleLocalMove}
+              lastMove={lastMove}
+              isCheck={isCheck}
+              gameOver={true}
+              gameOverReason={gameOverReason}
+            />
+            <MoveHistory chess={chess} />
+
+            <div className="flex justify-center">
+              <button
+                onClick={handleLeave}
+                className="px-6 py-3 rounded-xl bg-stone-800 text-white text-sm font-medium
+                           hover:bg-stone-700 transition-colors shadow-sm"
+              >
+                Back to Lobby
+              </button>
+            </div>
+          </div>
+        )}
       </main>
     </div>
   );
 }
+
