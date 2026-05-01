@@ -98,10 +98,6 @@ export function usePeerConnection(options: UsePeerConnectionOptions = {}): UsePe
   const setupDataConnection = useCallback(
     (conn: DataConnection, assignedRole: PlayerRole) => {
       connRef.current = conn;
-      setRole(assignedRole);
-      setStatus("connected");
-      setError(null);
-      clearWaitingTimer();
 
       conn.on("data", (data: unknown) => {
         const message = data as MessageType;
@@ -196,16 +192,26 @@ export function usePeerConnection(options: UsePeerConnectionOptions = {}): UsePe
       }
 
       clearWaitingTimer();
-      setStatus("connected");
 
-      // Send initial game state once connection is open
+      // Wait for data channel to fully open before signalling connection
       conn.on("open", () => {
-        // Send handshake
+        if (isDestroyedRef.current) return;
+        setStatus("connected");
         conn.send({ type: "handshake", role: "host" } as MessageType);
+        setupDataConnection(conn, "host");
+        onConnectionEstablished?.("host");
       });
 
-      setupDataConnection(conn, "host");
-      onConnectionEstablished?.("host");
+      // Timeout: surface error if data channel never opens
+      const connTimeout = setTimeout(() => {
+        if (!conn.open && !isDestroyedRef.current) {
+          setError("Failed to establish connection with opponent.");
+          setStatus("error");
+          onError?.("Data channel did not open on host side.");
+        }
+      }, 15_000);
+
+      conn.on("close", () => clearTimeout(connTimeout));
     });
 
     peer.on("disconnected", () => {
@@ -258,8 +264,26 @@ export function usePeerConnection(options: UsePeerConnectionOptions = {}): UsePe
           reliable: true,
         });
 
+        // Guard against peer.connect() returning undefined
+        if (!conn) {
+          setError("Failed to initiate connection. Please try again.");
+          setStatus("error");
+          onError?.("peer.connect() returned undefined");
+          return;
+        }
+
+        // Timeout: surface error if data channel never opens
+        const connTimeout = setTimeout(() => {
+          if (!conn.open && !isDestroyedRef.current) {
+            setError("Failed to establish connection with host.");
+            setStatus("error");
+            onError?.("Data channel did not open on joiner side.");
+          }
+        }, 15_000);
+
         conn.on("open", () => {
           if (isDestroyedRef.current) return;
+          clearTimeout(connTimeout);
 
           // Send handshake
           conn.send({ type: "handshake", role: "joiner" } as MessageType);
@@ -267,7 +291,10 @@ export function usePeerConnection(options: UsePeerConnectionOptions = {}): UsePe
           onConnectionEstablished?.("joiner");
         });
 
+        conn.on("close", () => clearTimeout(connTimeout));
+
         conn.on("error", (err) => {
+          clearTimeout(connTimeout);
           setError(err.message);
           setStatus("error");
           onError?.(err.message);
